@@ -20,24 +20,33 @@ CHUNK_PAUSE_MS = 350    # silence between chunks
 
 image = (
     modal.Image.debian_slim(python_version="3.12")
-    .apt_install("ffmpeg", "libsndfile1", "sox", "libsox-dev")
+    .apt_install("ffmpeg", "libsndfile1", "sox", "libsox-dev", "build-essential", "git", "ninja-build")
     .pip_install(
         "torch==2.5.1",
         "torchaudio==2.5.1",
-        "qwen-tts",
         "transformers==4.57.3",
         "accelerate==1.12.0",
-        "soundfile",
+        "einops",
         "numpy",
+        "soundfile",
         "sox",
         "onnxruntime",
-        "einops",
+        "qwen-tts",
         "fastapi[standard]",
-        "flash-attn --no-build-isolation",
+        # build deps needed by flash-attn's setup.py
+        "ninja",
+        "packaging",
+        "psutil",
+        "wheel",
+        "setuptools",
+    )
+    # flash-attn must be built with --no-build-isolation so it can see torch
+    .pip_install(
+        "flash-attn==2.7.4.post1",
+        extra_options="--no-build-isolation",
     )
     .env({"HF_HOME": "/cache", "MAX_JOBS": "4"})
 )
-
 # ──────────────────────────────────────────────────────────────
 # HTML Frontend (Tailwind CSS, vanilla JS, Web Audio playback)
 # ──────────────────────────────────────────────────────────────
