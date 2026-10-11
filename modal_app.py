@@ -15,23 +15,28 @@ hf_cache = modal.Volume.from_name("qwen3-tts-hf-cache", create_if_missing=True)
 ALLOWED_ORIGINS = ["https://privoice.netlify.app", "*"]
 
 MAX_CHARS = 10000
-CHUNK_SIZE = 350        # chars per chunk (matches Qwen3-TTS community practice)
-CHUNK_PAUSE_MS = 350    # silence between chunks (matches validated 350ms boundary)
+CHUNK_SIZE = 350        # chars per chunk
+CHUNK_PAUSE_MS = 350    # silence between chunks
 
 image = (
     modal.Image.debian_slim(python_version="3.12")
-    .apt_install("ffmpeg", "libsndfile1")
+    .apt_install("ffmpeg", "libsndfile1", "sox", "libsox-dev")
     .pip_install(
         "torch==2.5.1",
         "torchaudio==2.5.1",
         "qwen-tts",
+        "transformers==4.57.3",
+        "accelerate==1.12.0",
         "soundfile",
         "numpy",
+        "sox",
+        "onnxruntime",
+        "einops",
         "fastapi[standard]",
+        "flash-attn --no-build-isolation",
     )
-    .env({"HF_HOME": "/cache"})
+    .env({"HF_HOME": "/cache", "MAX_JOBS": "4"})
 )
-
 
 # ──────────────────────────────────────────────────────────────
 # HTML Frontend (Tailwind CSS, vanilla JS, Web Audio playback)
@@ -284,7 +289,6 @@ class TTS:
         import torch
         from qwen_tts import Qwen3TTSModel
 
-        # Base model supports voice cloning AND voice design
         self.model = Qwen3TTSModel.from_pretrained(
             "Qwen/Qwen3-TTS-12Hz-1.7B-Base",
             device_map="cuda:0",
@@ -301,21 +305,17 @@ class TTS:
         Packs complete sentences into chunks of at most `max_chars`,
         then hard-splits any sentence that exceeds the limit.
         """
-        # Normalise whitespace
         text = re.sub(r"\s+", " ", text).strip()
         if not text:
             return []
 
-        # Split on sentence-ending punctuation (keeps the punctuation)
         sentences = re.split(r"(?<=[.!?…])\s+", text)
 
         chunks: list[str] = []
         current = ""
 
         for sentence in sentences:
-            # If a single sentence is longer than max_chars, hard-split it
             while len(sentence) > max_chars:
-                # Try to break at a comma or space near the limit
                 split_at = sentence.rfind(", ", 0, max_chars)
                 if split_at == -1:
                     split_at = sentence.rfind(" ", 0, max_chars)
@@ -330,7 +330,6 @@ class TTS:
                 if piece:
                     chunks.append(piece)
 
-            # Try to add this sentence to the current chunk
             if not current:
                 current = sentence
             elif len(current) + 1 + len(sentence) <= max_chars:
@@ -404,7 +403,6 @@ class TTS:
                 # 3. Synthesise each chunk independently
                 for chunk in chunks:
                     if req.ref_audio_b64:
-                        # Voice cloning path
                         wavs, sr = self.model.generate_voice_clone(
                             text=chunk,
                             language=req.language,
@@ -412,7 +410,6 @@ class TTS:
                             ref_text=req.ref_text or "",
                         )
                     else:
-                        # Voice design path
                         wavs, sr = self.model.generate_voice_design(
                             text=chunk,
                             language=req.language,
