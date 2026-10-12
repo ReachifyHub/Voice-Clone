@@ -11,38 +11,16 @@ app = modal.App("qwen3-tts")
 # Persist model weights so cold starts don't re-download
 hf_cache = modal.Volume.from_name("qwen3-tts-hf-cache", create_if_missing=True)
 
-# Your Netlify site (if you still want CORS for it). The Modal frontend is same-origin.
-ALLOWED_ORIGINS = ["https://privoice.netlify.app", "*"]
+# Add your Netlify URL here if you still want CORS for it.
+# The Modal-served frontend is same-origin, so it doesn't need listing.
+ALLOWED_ORIGINS = ["https://privoice.netlify.app"]
 
 MAX_CHARS = 10000
-CHUNK_SIZE = 350        # chars per chunk
-CHUNK_PAUSE_MS = 350    # silence between chunks
+CHUNK_PAUSE_MS = 350
 
-image = (
-    modal.Image.debian_slim(python_version="3.12")
-    .apt_install("ffmpeg", "libsndfile1", "sox", "libsox-dev", "build-essential", "git", "ninja-build")
-    .pip_install(
-        "torch==2.5.1",
-        "torchaudio==2.5.1",
-        "transformers==4.57.3",
-        "accelerate==1.12.0",
-        "einops",
-        "numpy",
-        "soundfile",
-        "sox",
-        "onnxruntime",
-        "qwen-tts",
-        "fastapi[standard]",
-        # build deps needed by flash-attn's setup.py
-        "ninja",
-        "packaging",
-        "psutil",
-        "wheel",
-        "setuptools",
-    )
-)
+
 # ──────────────────────────────────────────────────────────────
-# HTML Frontend (Tailwind CSS, vanilla JS, Web Audio playback)
+# Frontend HTML (Tailwind, vanilla JS)
 # ──────────────────────────────────────────────────────────────
 FRONTEND_HTML = r"""<!DOCTYPE html>
 <html lang="en">
@@ -51,11 +29,6 @@ FRONTEND_HTML = r"""<!DOCTYPE html>
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Qwen3 TTS Studio</title>
   <script src="https://cdn.tailwindcss.com"></script>
-  <style>
-    .spinner { border: 3px solid rgba(255,255,255,.2); border-top-color:#fff;
-               border-radius:50%; width:20px; height:20px; animation:spin .6s linear infinite; }
-    @keyframes spin { to { transform: rotate(360deg); } }
-  </style>
 </head>
 <body class="bg-slate-900 text-slate-100 min-h-screen">
   <div class="max-w-3xl mx-auto px-4 py-10">
@@ -160,11 +133,10 @@ FRONTEND_HTML = r"""<!DOCTYPE html>
 
 <script>
 const $ = (s) => document.querySelector(s);
-const API = "/tts";   // same-origin — Modal serves both frontend and API
+const API = "/tts";
 
 let mode = "design";
 
-/* ── Tab switching ─────────────────────────────── */
 document.querySelectorAll(".mode-btn").forEach(btn => {
   btn.addEventListener("click", () => {
     mode = btn.dataset.mode;
@@ -177,12 +149,10 @@ document.querySelectorAll(".mode-btn").forEach(btn => {
   });
 });
 
-/* ── Char counter ──────────────────────────────── */
 $("#text").addEventListener("input", e => {
   $("#charCount").textContent = e.target.value.length;
 });
 
-/* ── Helpers ───────────────────────────────────── */
 function fileToBase64(file) {
   return new Promise((resolve, reject) => {
     const r = new FileReader();
@@ -203,9 +173,7 @@ function hideError() { $("#errorBox").classList.add("hidden"); }
 function setBusy(busy) {
   $("#generateBtn").disabled = busy;
   $("#btnText").textContent = busy ? "Generating…" : "Generate Speech";
-  if (busy) {
-    $("#progressWrap").classList.remove("hidden");
-  }
+  if (busy) $("#progressWrap").classList.remove("hidden");
 }
 
 function setProgress(current, total, label) {
@@ -214,7 +182,6 @@ function setProgress(current, total, label) {
   $("#progressLabel").textContent = label || `Chunk ${current} of ${total}`;
 }
 
-/* ── Main generate ─────────────────────────────── */
 $("#generateBtn").addEventListener("click", async () => {
   hideError();
   const text = $("#text").value.trim();
@@ -232,7 +199,6 @@ $("#generateBtn").addEventListener("click", async () => {
     refText = $("#refText").value.trim() || null;
   }
 
-  // Send full text + chunk size — server handles splitting
   const body = {
     text,
     language,
@@ -243,7 +209,7 @@ $("#generateBtn").addEventListener("click", async () => {
   };
 
   setBusy(true);
-  setProgress(0, 1, "Starting…");
+  setProgress(0, 1, "Warming up the model (first run may take ~1 min)…");
 
   try {
     const res = await fetch(API, {
@@ -257,7 +223,6 @@ $("#generateBtn").addEventListener("click", async () => {
       throw new Error(err.detail || "Server error");
     }
 
-    // Server returns a single WAV (all chunks concatenated server-side)
     const blob = await res.blob();
     const url = URL.createObjectURL(blob);
 
@@ -278,12 +243,34 @@ $("#generateBtn").addEventListener("click", async () => {
 """
 
 
+# ──────────────────────────────────────────────────────────────
+# GPU image + TTS class
+# ──────────────────────────────────────────────────────────────
+tts_image = (
+    modal.Image.debian_slim(python_version="3.12")
+    .apt_install("ffmpeg", "libsndfile1", "sox", "libsox-dev")
+    .pip_install(
+        "torch==2.5.1",
+        "torchaudio==2.5.1",
+        "transformers==4.57.3",
+        "accelerate==1.12.0",
+        "einops",
+        "numpy",
+        "soundfile",
+        "sox",
+        "onnxruntime",
+        "qwen-tts",
+    )
+    .env({"HF_HOME": "/cache"})
+)
+
+
 @app.cls(
-    image=image,
+    image=tts_image,
     gpu="L4",
     volumes={"/cache": hf_cache},
-    scaledown_window=80,
-    max_containers=1,
+    scaledown_window=300,   # keep warm for 5 min after last request
+    max_containers=1,       # hard cap on parallel GPUs
     timeout=1200,
 )
 class TTS:
@@ -300,14 +287,10 @@ class TTS:
         )
         hf_cache.commit()
 
-    # ── Chunking helper ──────────────────────────────────────
     @staticmethod
     def chunk_text(text: str, max_chars: int = 350) -> list[str]:
-        """
-        Split text into sentence-aligned chunks.
-        Packs complete sentences into chunks of at most `max_chars`,
-        then hard-splits any sentence that exceeds the limit.
-        """
+        """Sentence-aware chunker: packs complete sentences up to max_chars,
+        hard-splits anything longer at commas/spaces."""
         text = re.sub(r"\s+", " ", text).strip()
         if not text:
             return []
@@ -346,97 +329,111 @@ class TTS:
 
         return [c for c in chunks if c]
 
-    # ── ASGI app ─────────────────────────────────────────────
-    @modal.asgi_app()
-    def web(self):
-        import io as _io
-
+    @modal.method()
+    def synthesize(self, payload: dict) -> bytes:
+        """Runs on GPU. Takes a plain dict, returns raw WAV bytes."""
         import numpy as np
         import soundfile as sf
-        from fastapi import FastAPI, HTTPException
-        from fastapi.middleware.cors import CORSMiddleware
-        from fastapi.responses import HTMLResponse, Response
-        from pydantic import BaseModel
 
-        class Req(BaseModel):
-            text: str
-            language: str = "Auto"
-            instruct: str | None = None
-            ref_audio_b64: str | None = None
-            ref_text: str | None = None
-            chunk_size: int = 350
+        text = payload.get("text", "")
+        language = payload.get("language", "Auto")
+        chunk_size = int(payload.get("chunk_size", 350))
+        instruct = payload.get("instruct")
+        ref_audio_b64 = payload.get("ref_audio_b64")
+        ref_text = payload.get("ref_text")
 
-        api = FastAPI()
-        api.add_middleware(
-            CORSMiddleware,
-            allow_origins=ALLOWED_ORIGINS,
-            allow_methods=["POST", "OPTIONS"],
-            allow_headers=["*"],
-        )
+        if not text.strip():
+            raise ValueError("Text is empty")
+        if len(text) > MAX_CHARS:
+            raise ValueError(f"Text too long (max {MAX_CHARS} characters)")
 
-        # ── Serve frontend at root ───────────────────────
-        @api.get("/", response_class=HTMLResponse)
-        def index():
-            return FRONTEND_HTML
+        chunks = self.chunk_text(text, chunk_size)
+        if not chunks:
+            raise ValueError("No speakable text after chunking")
 
-        # ── TTS endpoint ─────────────────────────────────
-        @api.post("/tts")
-        def tts(req: Req):
-            if not req.text.strip():
-                raise HTTPException(400, "Text is empty")
-            if len(req.text) > MAX_CHARS:
-                raise HTTPException(400, f"Text too long (max {MAX_CHARS} characters)")
+        tmp_path = None
+        if ref_audio_b64:
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+                f.write(base64.b64decode(ref_audio_b64))
+                tmp_path = f.name
 
-            # 1. Chunk the script
-            chunks = self.chunk_text(req.text, req.chunk_size)
-            if not chunks:
-                raise HTTPException(400, "No speakable text after chunking")
+        try:
+            all_audio: list = []
+            sr = 24000
 
-            # 2. Prepare reference audio temp file (if cloning)
-            tmp_path = None
-            if req.ref_audio_b64:
-                with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
-                    f.write(base64.b64decode(req.ref_audio_b64))
-                    tmp_path = f.name
-
-            try:
-                all_audio: list[np.ndarray] = []
-                sr = 24000
-
-                # 3. Synthesise each chunk independently
-                for chunk in chunks:
-                    if req.ref_audio_b64:
-                        wavs, sr = self.model.generate_voice_clone(
-                            text=chunk,
-                            language=req.language,
-                            ref_audio=tmp_path,
-                            ref_text=req.ref_text or "",
-                        )
-                    else:
-                        wavs, sr = self.model.generate_voice_design(
-                            text=chunk,
-                            language=req.language,
-                            instruct=req.instruct or "",
-                        )
-                    all_audio.append(wavs[0])
-
-                    # 4. Insert a short pause between chunks
-                    pause = np.zeros(int(sr * CHUNK_PAUSE_MS / 1000), dtype=np.float32)
-                    all_audio.append(pause)
-
-                # 5. Concatenate, trimming the final pause
-                if len(all_audio) > 1:
-                    combined = np.concatenate(all_audio[:-1])
+            for chunk in chunks:
+                if ref_audio_b64:
+                    wavs, sr = self.model.generate_voice_clone(
+                        text=chunk,
+                        language=language,
+                        ref_audio=tmp_path,
+                        ref_text=ref_text or "",
+                    )
                 else:
-                    combined = np.concatenate(all_audio)
+                    wavs, sr = self.model.generate_voice_design(
+                        text=chunk,
+                        language=language,
+                        instruct=instruct or "",
+                    )
+                all_audio.append(wavs[0])
+                pause = np.zeros(int(sr * CHUNK_PAUSE_MS / 1000), dtype=np.float32)
+                all_audio.append(pause)
 
-                # 6. Encode to WAV
-                buf = _io.BytesIO()
-                sf.write(buf, combined, sr, format="WAV")
-                return Response(buf.getvalue(), media_type="audio/wav")
+            combined = np.concatenate(all_audio[:-1]) if len(all_audio) > 1 else np.concatenate(all_audio)
 
-            finally:
-                if tmp_path:
-                    os.unlink(tmp_path)
+            buf = io.BytesIO()
+            sf.write(buf, combined, sr, format="WAV")
+            return buf.getvalue()
 
-        return api
+        finally:
+            if tmp_path:
+                os.unlink(tmp_path)
+
+
+# ──────────────────────────────────────────────────────────────
+# Lightweight frontend + proxy (no torch, no GPU, boots in seconds)
+# ──────────────────────────────────────────────────────────────
+frontend_image = (
+    modal.Image.debian_slim(python_version="3.12")
+    .pip_install("fastapi[standard]")
+)
+
+
+@app.function(image=frontend_image, timeout=1200, min_containers=0)
+@modal.asgi_app()
+def web():
+    from fastapi import FastAPI, HTTPException, Request
+    from fastapi.middleware.cors import CORSMiddleware
+    from fastapi.responses import HTMLResponse, Response
+
+    api = FastAPI()
+    api.add_middleware(
+        CORSMiddleware,
+        allow_origins=ALLOWED_ORIGINS,
+        allow_methods=["POST", "OPTIONS"],
+        allow_headers=["*"],
+    )
+
+    @api.get("/", response_class=HTMLResponse)
+    def index():
+        return FRONTEND_HTML
+
+    @api.post("/tts")
+    async def tts_proxy(request: Request):
+        try:
+            payload = await request.json()
+        except Exception:
+            raise HTTPException(400, "Invalid JSON body")
+
+        try:
+            # First call triggers the GPU class cold start.
+            # Subsequent calls reuse the warm container.
+            wav_bytes = await TTS().synthesize.remote.aio(payload)
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+        except Exception as e:
+            raise HTTPException(500, f"Synthesis failed: {e}")
+
+        return Response(wav_bytes, media_type="audio/wav")
+
+    return api
