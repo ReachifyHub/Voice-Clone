@@ -40,12 +40,6 @@ image = (
         "wheel",
         "setuptools",
     )
-    # flash-attn must be built with --no-build-isolation so it can see torch
-    .pip_install(
-        "flash-attn==2.7.4.post1",
-        extra_options="--no-build-isolation",
-    )
-    .env({"HF_HOME": "/cache", "MAX_JOBS": "4"})
 )
 # ──────────────────────────────────────────────────────────────
 # HTML Frontend (Tailwind CSS, vanilla JS, Web Audio playback)
@@ -302,7 +296,7 @@ class TTS:
             "Qwen/Qwen3-TTS-12Hz-1.7B-Base",
             device_map="cuda:0",
             dtype=torch.bfloat16,
-            attn_implementation="flash_attention_2",
+            attn_implementation="sdpa",
         )
         hf_cache.commit()
 
