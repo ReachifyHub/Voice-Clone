@@ -1,439 +1,415 @@
+"""
+Qwen3-TTS-12Hz-1.7B-Base — Voice Cloner on Modal (L4 GPU)
+
+Architecture:
+  - Model weights are downloaded ONCE into a Modal Volume (`qwen3-tts-weights`)
+    and reused by every container afterwards.
+  - The web server / frontend does NOT wait for the model. The model is loaded
+    in a background thread at container startup, so the page is served instantly
+    and the UI just polls /status until the model is warm.
+  - Long scripts are split into sentence-level chunks server-side; each chunk is
+    synthesized separately (reusing one pre-built voice-clone prompt) and streamed
+    to the browser over SSE, so prosody stays natural and playback starts fast.
+
+Deploy:
+    pip install modal
+    modal setup
+    modal run qwen3_tts_modal.py      # one-time: downloads ~4GB weights to the volume
+    modal deploy qwen3_tts_modal.py   # deploys the web app, prints the URL
+"""
+
 import base64
 import io
-import os
 import re
-import tempfile
+import threading
 
 import modal
 
-app = modal.App("qwen3-tts")
+app = modal.App("qwen3-tts-voice-cloner")
 
-# Persist model weights so cold starts don't re-download
-hf_cache = modal.Volume.from_name("qwen3-tts-hf-cache", create_if_missing=True)
+MODEL_ID = "Qwen/Qwen3-TTS-12Hz-1.7B-Base"
+MODEL_DIR = "/models/qwen3-tts-12hz-1.7b-base"   # inside the volume
 
-# Add your Netlify URL here if you still want CORS for it.
-# The Modal-served frontend is same-origin, so it doesn't need listing.
-ALLOWED_ORIGINS = ["https://privoice.netlify.app"]
+weights_volume = modal.Volume.from_name("qwen3-tts-weights", create_if_missing=True)
 
-MAX_CHARS = 10000
-CHUNK_PAUSE_MS = 350
-
-
-# ──────────────────────────────────────────────────────────────
-# Frontend HTML (Tailwind, vanilla JS)
-# ──────────────────────────────────────────────────────────────
-FRONTEND_HTML = r"""<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Qwen3 TTS Studio</title>
-  <script src="https://cdn.tailwindcss.com"></script>
-</head>
-<body class="bg-slate-900 text-slate-100 min-h-screen">
-  <div class="max-w-3xl mx-auto px-4 py-10">
-    <h1 class="text-3xl font-bold mb-2">Qwen3 TTS Studio</h1>
-    <p class="text-slate-400 mb-8 text-sm">Voice cloning · Voice design · Chunked synthesis</p>
-
-    <!-- Mode Tabs -->
-    <div class="flex gap-2 mb-6">
-      <button data-mode="design" class="mode-btn px-4 py-2 rounded-lg bg-indigo-600 text-sm font-medium">Voice Design</button>
-      <button data-mode="clone"  class="mode-btn px-4 py-2 rounded-lg bg-slate-700 text-sm font-medium">Voice Clone</button>
-    </div>
-
-    <!-- Voice Design panel -->
-    <div id="panel-design" class="space-y-4">
-      <div>
-        <label class="block text-sm text-slate-400 mb-1">Voice description</label>
-        <input id="instruct" type="text" placeholder="e.g. female, british accent, warm tone"
-               class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm
-                      focus:outline-none focus:ring-2 focus:ring-indigo-500" />
-      </div>
-    </div>
-
-    <!-- Voice Clone panel -->
-    <div id="panel-clone" class="space-y-4 hidden">
-      <div>
-        <label class="block text-sm text-slate-400 mb-1">Reference audio (3–10 s)</label>
-        <input id="refAudio" type="file" accept="audio/*"
-               class="block w-full text-sm text-slate-400 file:mr-3 file:py-2 file:px-4
-                      file:rounded-lg file:border-0 file:bg-slate-700 file:text-slate-200
-                      file:text-sm file:font-medium hover:file:bg-slate-600" />
-      </div>
-      <div>
-        <label class="block text-sm text-slate-400 mb-1">Reference transcript</label>
-        <input id="refText" type="text" placeholder="Exact words spoken in the clip"
-               class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm
-                      focus:outline-none focus:ring-2 focus:ring-indigo-500" />
-      </div>
-    </div>
-
-    <!-- Shared controls -->
-    <div class="grid grid-cols-2 gap-4 mt-6">
-      <div>
-        <label class="block text-sm text-slate-400 mb-1">Language</label>
-        <select id="language"
-                class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm">
-          <option value="Auto">Auto</option>
-          <option value="English" selected>English</option>
-          <option value="Chinese">Chinese</option>
-          <option value="Japanese">Japanese</option>
-          <option value="Korean">Korean</option>
-          <option value="German">German</option>
-          <option value="French">French</option>
-          <option value="Russian">Russian</option>
-          <option value="Portuguese">Portuguese</option>
-          <option value="Spanish">Spanish</option>
-          <option value="Italian">Italian</option>
-        </select>
-      </div>
-      <div>
-        <label class="block text-sm text-slate-400 mb-1">Chunk size (chars)</label>
-        <input id="chunkSize" type="number" value="350" min="100" max="800"
-               class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm" />
-      </div>
-    </div>
-
-    <!-- Script input -->
-    <div class="mt-6">
-      <label class="block text-sm text-slate-400 mb-1">Script</label>
-      <textarea id="text" rows="8" placeholder="Paste your full script here…"
-                class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm
-                       focus:outline-none focus:ring-2 focus:ring-indigo-500 resize-y"></textarea>
-      <div class="text-right text-xs text-slate-500 mt-1"><span id="charCount">0</span> chars</div>
-    </div>
-
-    <!-- Generate button -->
-    <button id="generateBtn"
-            class="mt-6 w-full bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50
-                   disabled:cursor-not-allowed font-semibold py-3 rounded-lg transition
-                   flex items-center justify-center gap-2">
-      <span id="btnText">Generate Speech</span>
-    </button>
-
-    <!-- Progress -->
-    <div id="progressWrap" class="mt-4 hidden">
-      <div class="w-full bg-slate-800 rounded-full h-2 overflow-hidden">
-        <div id="progressBar" class="bg-indigo-500 h-2 transition-all duration-300" style="width:0%"></div>
-      </div>
-      <p id="progressLabel" class="text-xs text-slate-400 mt-2"></p>
-    </div>
-
-    <!-- Audio player -->
-    <div id="audioWrap" class="mt-6 hidden">
-      <audio id="player" controls class="w-full"></audio>
-      <a id="downloadLink" download="qwen3-output.wav"
-         class="inline-block mt-3 text-sm text-indigo-400 hover:text-indigo-300">↓ Download WAV</a>
-    </div>
-
-    <!-- Error -->
-    <div id="errorBox" class="mt-4 hidden bg-red-900/40 border border-red-700 text-red-300
-                              rounded-lg px-4 py-3 text-sm"></div>
-  </div>
-
-<script>
-const $ = (s) => document.querySelector(s);
-const API = "/tts";
-
-let mode = "design";
-
-document.querySelectorAll(".mode-btn").forEach(btn => {
-  btn.addEventListener("click", () => {
-    mode = btn.dataset.mode;
-    document.querySelectorAll(".mode-btn").forEach(b => {
-      b.classList.toggle("bg-indigo-600", b.dataset.mode === mode);
-      b.classList.toggle("bg-slate-700",  b.dataset.mode !== mode);
-    });
-    $("#panel-design").classList.toggle("hidden", mode !== "design");
-    $("#panel-clone").classList.toggle("hidden",  mode !== "clone");
-  });
-});
-
-$("#text").addEventListener("input", e => {
-  $("#charCount").textContent = e.target.value.length;
-});
-
-function fileToBase64(file) {
-  return new Promise((resolve, reject) => {
-    const r = new FileReader();
-    r.onload = () => resolve(r.result.split(",")[1]);
-    r.onerror = reject;
-    r.readAsDataURL(file);
-  });
-}
-
-function showError(msg) {
-  const el = $("#errorBox");
-  el.textContent = msg;
-  el.classList.remove("hidden");
-}
-
-function hideError() { $("#errorBox").classList.add("hidden"); }
-
-function setBusy(busy) {
-  $("#generateBtn").disabled = busy;
-  $("#btnText").textContent = busy ? "Generating…" : "Generate Speech";
-  if (busy) $("#progressWrap").classList.remove("hidden");
-}
-
-function setProgress(current, total, label) {
-  const pct = total > 0 ? Math.round((current / total) * 100) : 0;
-  $("#progressBar").style.width = pct + "%";
-  $("#progressLabel").textContent = label || `Chunk ${current} of ${total}`;
-}
-
-$("#generateBtn").addEventListener("click", async () => {
-  hideError();
-  const text = $("#text").value.trim();
-  if (!text) { showError("Please enter some text."); return; }
-
-  const chunkSize = parseInt($("#chunkSize").value) || 350;
-  const language  = $("#language").value;
-
-  let refAudioB64 = null;
-  let refText = null;
-  if (mode === "clone") {
-    const file = $("#refAudio").files[0];
-    if (!file) { showError("Please upload a reference audio clip."); return; }
-    refAudioB64 = await fileToBase64(file);
-    refText = $("#refText").value.trim() || null;
-  }
-
-  const body = {
-    text,
-    language,
-    chunk_size: chunkSize,
-    instruct: mode === "design" ? ($("#instruct").value.trim() || null) : null,
-    ref_audio_b64: refAudioB64,
-    ref_text: refText,
-  };
-
-  setBusy(true);
-  setProgress(0, 1, "Warming up the model (first run may take ~1 min)…");
-
-  try {
-    const res = await fetch(API, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-    });
-
-    if (!res.ok) {
-      const err = await res.json().catch(() => ({ detail: res.statusText }));
-      throw new Error(err.detail || "Server error");
-    }
-
-    const blob = await res.blob();
-    const url = URL.createObjectURL(blob);
-
-    $("#player").src = url;
-    $("#downloadLink").href = url;
-    $("#audioWrap").classList.remove("hidden");
-    setProgress(1, 1, "Done ✓");
-  } catch (e) {
-    showError(e.message);
-    $("#progressWrap").classList.add("hidden");
-  } finally {
-    setBusy(false);
-  }
-});
-</script>
-</body>
-</html>
-"""
-
-
-# ──────────────────────────────────────────────────────────────
-# GPU image + TTS class
-# ──────────────────────────────────────────────────────────────
-tts_image = (
+image = (
     modal.Image.debian_slim(python_version="3.12")
-    .apt_install("ffmpeg", "libsndfile1", "sox", "libsox-dev")
     .pip_install(
-        "torch==2.5.1",
-        "torchaudio==2.5.1",
-        "transformers==4.57.3",
-        "accelerate==1.12.0",
-        "einops",
-        "numpy",
+        "qwen-tts",              # pulls torch, transformers, soundfile, etc.
+        "accelerate",            # needed for device_map="cuda:0"
+        "fastapi[standard]",
+        "python-multipart",
         "soundfile",
-        "sox",
-        "onnxruntime",
-        "qwen-tts",
+        "numpy",
     )
-    .env({"HF_HOME": "/cache"})
 )
 
 
+# --------------------------------------------------------------------------- #
+# One-time weight download into the Modal volume
+# --------------------------------------------------------------------------- #
+@app.function(image=image, volumes={"/models": weights_volume}, timeout=60 * 60)
+def download_model():
+    from huggingface_hub import snapshot_download
+
+    print(f"Downloading {MODEL_ID} into the volume (one-time)...")
+    snapshot_download(MODEL_ID, local_dir=MODEL_DIR)
+    weights_volume.commit()
+    print("Done. Weights are cached in the 'qwen3-tts-weights' volume.")
+
+
+@app.local_entrypoint()
+def main():
+    download_model.remote()
+
+
+# --------------------------------------------------------------------------- #
+# Sentence-level chunking — the key to natural-sounding long-form speech.
+# Sending a whole script at once makes the model produce flat, run-on speech.
+# --------------------------------------------------------------------------- #
+_MAX_CHUNK_CHARS = 180  # ~1-2 sentences per synthesis call
+
+
+def _split_long_sentence(sentence: str, max_chars: int) -> list[str]:
+    """Split an over-long sentence at commas/colons without losing punctuation."""
+    parts = re.split(r"(?<=[,，、:：;；—–-])\s+", sentence)
+    out, cur = [], ""
+    for p in parts:
+        if len(cur) + len(p) + 1 <= max_chars:
+            cur = f"{cur} {p}".strip()
+        else:
+            if cur:
+                out.append(cur)
+            cur = p
+    if cur:
+        out.append(cur)
+    return out or [sentence]
+
+
+def chunk_text(text: str) -> list[str]:
+    """Split a script into natural chunks at sentence boundaries."""
+    sentence_re = re.compile(r"[^.!?。！？\n]+[.!?。！？]*")
+    sentences = [m.group(0).strip() for m in sentence_re.finditer(text)]
+    sentences = [s for s in sentences if s]
+
+    chunks, current = [], ""
+    for s in sentences:
+        if len(current) + len(s) + 1 <= _MAX_CHUNK_CHARS:
+            current = f"{current} {s}".strip()
+        else:
+            if current:
+                chunks.append(current)
+            if len(s) <= _MAX_CHUNK_CHARS:
+                current = s
+            else:
+                chunks.extend(_split_long_sentence(s, _MAX_CHUNK_CHARS))
+                current = ""
+    if current:
+        chunks.append(current)
+    return chunks
+
+
+# --------------------------------------------------------------------------- #
+# The GPU-backed TTS service
+# --------------------------------------------------------------------------- #
 @app.cls(
-    image=tts_image,
     gpu="L4",
-    volumes={"/cache": hf_cache},
-    scaledown_window=300,   # keep warm for 5 min after last request
-    max_containers=1,       # hard cap on parallel GPUs
-    timeout=1200,
+    image=image,
+    volumes={"/models": weights_volume},
+    scaledown_window=15 * 60,   # keep the container (and warm model) alive 15 min
+    timeout=60 * 30,
 )
 class TTS:
     @modal.enter()
-    def load(self):
-        import torch
-        from qwen_tts import Qwen3TTSModel
+    def startup(self):
+        """Runs when the container starts. IMPORTANT: this must return fast,
+        because Modal starts routing HTTP traffic only after @modal.enter
+        returns. So we kick the (slow) model load off in a daemon thread and
+        serve the frontend immediately while weights load in the background."""
+        self.ready_event = threading.Event()
+        self.load_error = None
+        self.gen_lock = threading.Lock()          # serialize GPU generation
+        threading.Thread(target=self._load_model, daemon=True).start()
 
-        self.model = Qwen3TTSModel.from_pretrained(
-            "Qwen/Qwen3-TTS-12Hz-1.7B-Base",
-            device_map="cuda:0",
-            dtype=torch.bfloat16,
-            attn_implementation="sdpa",
+    def _load_model(self):
+        try:
+            import torch
+            from qwen_tts import Qwen3TTSModel
+
+            self.model = Qwen3TTSModel.from_pretrained(
+                MODEL_DIR,                        # served from the cached volume
+                device_map="cuda:0",
+                dtype=torch.bfloat16,
+                attn_implementation="sdpa",       # use "flash_attention_2" if you add flash-attn to the image
+            )
+        except Exception as e:                    # surfaced to the frontend
+            self.load_error = f"{type(e).__name__}: {e}"
+        finally:
+            self.ready_event.set()
+
+    # ------------------------------ endpoints ------------------------------ #
+    @modal.fastapi_endpoint(method="GET")
+    def status(self):
+        """Frontend polls this to show a 'warming up' / 'ready' indicator."""
+        return {
+            "ready": self.ready_event.is_set() and self.load_error is None,
+            "error": self.load_error,
+        }
+
+    @modal.fastapi_endpoint(method="GET")
+    def home(self):
+        """Serves the UI instantly — no model dependency."""
+        from fastapi.responses import HTMLResponse
+
+        return HTMLResponse(FRONTEND_HTML)
+
+    @modal.fastapi_endpoint(method="POST")
+    async def synthesize(
+        self,
+        ref_audio: "object",   # UploadFile — annotated below via fastapi
+        ref_text: str = "",
+        text: str = "",
+        language: str = "auto",
+    ):
+        """Voice-clone endpoint: accepts your reference audio + transcript and
+        the script to speak, then streams synthesized audio chunk-by-chunk
+        (server-sent events) so playback starts after the first sentence."""
+        from fastapi import UploadFile
+        from fastapi.responses import StreamingResponse
+
+        ref_audio: UploadFile = ref_audio  # type: ignore[no-redef]
+
+        if not self.ready_event.is_set():
+            return StreamingResponse(
+                _sse({"error": "Model is still warming up — try again in a moment."}),
+                media_type="text/event-stream",
+            )
+        if self.load_error:
+            return StreamingResponse(
+                _sse({"error": f"Model failed to load: {self.load_error}"}),
+                media_type="text/event-stream",
+            )
+        if not text.strip():
+            return StreamingResponse(_sse({"error": "No script provided."}),
+                                     media_type="text/event-stream")
+
+        ref_bytes = await ref_audio.read()
+        return StreamingResponse(
+            self._generate_stream(ref_bytes, ref_text, text, language),
+            media_type="text/event-stream",
         )
-        hf_cache.commit()
 
-    @staticmethod
-    def chunk_text(text: str, max_chars: int = 350) -> list[str]:
-        """Sentence-aware chunker: packs complete sentences up to max_chars,
-        hard-splits anything longer at commas/spaces."""
-        text = re.sub(r"\s+", " ", text).strip()
-        if not text:
-            return []
-
-        sentences = re.split(r"(?<=[.!?…])\s+", text)
-
-        chunks: list[str] = []
-        current = ""
-
-        for sentence in sentences:
-            while len(sentence) > max_chars:
-                split_at = sentence.rfind(", ", 0, max_chars)
-                if split_at == -1:
-                    split_at = sentence.rfind(" ", 0, max_chars)
-                if split_at == -1:
-                    split_at = max_chars
-                piece = sentence[:split_at + 1].strip()
-                sentence = sentence[split_at + 1:].strip()
-
-                if current:
-                    chunks.append(current.strip())
-                    current = ""
-                if piece:
-                    chunks.append(piece)
-
-            if not current:
-                current = sentence
-            elif len(current) + 1 + len(sentence) <= max_chars:
-                current += " " + sentence
-            else:
-                chunks.append(current.strip())
-                current = sentence
-
-        if current.strip():
-            chunks.append(current.strip())
-
-        return [c for c in chunks if c]
-
-    @modal.method()
-    def synthesize(self, payload: dict) -> bytes:
-        """Runs on GPU. Takes a plain dict, returns raw WAV bytes."""
-        import numpy as np
+    # --------------------------- generation core --------------------------- #
+    def _generate_stream(self, ref_bytes: bytes, ref_text: str,
+                         text: str, language: str):
         import soundfile as sf
 
-        text = payload.get("text", "")
-        language = payload.get("language", "Auto")
-        chunk_size = int(payload.get("chunk_size", 350))
-        instruct = payload.get("instruct")
-        ref_audio_b64 = payload.get("ref_audio_b64")
-        ref_text = payload.get("ref_text")
+        with self.gen_lock:
+            try:
+                # Decode the uploaded reference clip once
+                ref_wav, ref_sr = sf.read(io.BytesIO(ref_bytes))
 
-        if not text.strip():
-            raise ValueError("Text is empty")
-        if len(text) > MAX_CHARS:
-            raise ValueError(f"Text too long (max {MAX_CHARS} characters)")
+                # Build the voice-clone prompt ONCE and reuse it for every
+                # chunk — this is what keeps the voice consistent throughout
+                prompt = self.model.create_voice_clone_prompt(
+                    ref_audio=(ref_wav, ref_sr),
+                    ref_text=ref_text.strip(),
+                    x_vector_only_mode=False,
+                )
 
-        chunks = self.chunk_text(text, chunk_size)
-        if not chunks:
-            raise ValueError("No speakable text after chunking")
+                chunks = chunk_text(text)
+                yield _sse({"total": len(chunks)})
 
-        tmp_path = None
-        if ref_audio_b64:
-            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
-                f.write(base64.b64decode(ref_audio_b64))
-                tmp_path = f.name
-
-        try:
-            all_audio: list = []
-            sr = 24000
-
-            for chunk in chunks:
-                if ref_audio_b64:
+                for i, chunk in enumerate(chunks):
                     wavs, sr = self.model.generate_voice_clone(
                         text=chunk,
                         language=language,
-                        ref_audio=tmp_path,
-                        ref_text=ref_text or "",
+                        voice_clone_prompt=prompt,
+                        max_new_tokens=2048,
                     )
-                else:
-                    wavs, sr = self.model.generate_voice_design(
-                        text=chunk,
-                        language=language,
-                        instruct=instruct or "",
-                    )
-                all_audio.append(wavs[0])
-                pause = np.zeros(int(sr * CHUNK_PAUSE_MS / 1000), dtype=np.float32)
-                all_audio.append(pause)
-
-            combined = np.concatenate(all_audio[:-1]) if len(all_audio) > 1 else np.concatenate(all_audio)
-
-            buf = io.BytesIO()
-            sf.write(buf, combined, sr, format="WAV")
-            return buf.getvalue()
-
-        finally:
-            if tmp_path:
-                os.unlink(tmp_path)
+                    buf = io.BytesIO()
+                    sf.write(buf, wavs[0], sr, format="WAV")
+                    payload = base64.b64encode(buf.getvalue()).decode()
+                    yield _sse({"i": i, "audio": payload})
+                yield _sse({"done": True})
+            except Exception as e:
+                yield _sse({"error": f"{type(e).__name__}: {e}"})
 
 
-# ──────────────────────────────────────────────────────────────
-# Lightweight frontend + proxy (no torch, no GPU, boots in seconds)
-# ──────────────────────────────────────────────────────────────
-frontend_image = (
-    modal.Image.debian_slim(python_version="3.12")
-    .pip_install("fastapi[standard]")
-)
+def _sse(obj: dict) -> str:
+    import json
+
+    return f"data: {json.dumps(obj)}\n\n"
 
 
-@app.function(image=frontend_image, timeout=1200, min_containers=0)
-@modal.asgi_app()
-def web():
-    from fastapi import FastAPI, HTTPException, Request
-    from fastapi.middleware.cors import CORSMiddleware
-    from fastapi.responses import HTMLResponse, Response
+# --------------------------------------------------------------------------- #
+# Frontend — self-contained, served instantly from the same Modal URL
+# --------------------------------------------------------------------------- #
+FRONTEND_HTML = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Qwen3-TTS Voice Cloner</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: system-ui, -apple-system, sans-serif; background: #0d1117;
+         color: #e6edf3; min-height: 100vh; display: flex; justify-content: center;
+         padding: 40px 16px; }
+  .card { width: 100%; max-width: 640px; background: #161b22; border: 1px solid #30363d;
+          border-radius: 14px; padding: 28px; }
+  h1 { font-size: 22px; margin-bottom: 4px; }
+  .sub { color: #8b949e; font-size: 13px; margin-bottom: 20px; }
+  .pill { display: inline-block; font-size: 12px; padding: 4px 12px; border-radius: 999px;
+          margin-bottom: 20px; font-weight: 600; }
+  .pill.loading { background: #2d2410; color: #e3b341; }
+  .pill.ready { background: #12261e; color: #3fb950; }
+  .pill.error { background: #2d1518; color: #f85149; }
+  label { display: block; font-size: 13px; color: #8b949e; margin: 14px 0 6px; }
+  input[type=file], input[type=text], select, textarea {
+    width: 100%; background: #0d1117; border: 1px solid #30363d; color: #e6edf3;
+    border-radius: 8px; padding: 10px 12px; font-size: 14px; }
+  textarea { min-height: 140px; resize: vertical; line-height: 1.5; }
+  input:focus, textarea:focus, select:focus { outline: 2px solid #1f6feb; }
+  button { width: 100%; margin-top: 20px; padding: 12px; font-size: 15px; font-weight: 700;
+           border: none; border-radius: 8px; cursor: pointer;
+           background: #1f6feb; color: #fff; transition: background .15s; }
+  button:hover:not(:disabled) { background: #388bfd; }
+  button:disabled { background: #21262d; color: #484f58; cursor: not-allowed; }
+  #status { margin-top: 14px; font-size: 13px; color: #8b949e; min-height: 20px; }
+  #progressWrap { height: 6px; background: #21262d; border-radius: 3px;
+                  margin-top: 10px; overflow: hidden; display: none; }
+  #progress { height: 100%; width: 0%; background: #1f6feb; transition: width .2s; }
+  #dl { display: none; margin-top: 12px; text-align: center; color: #58a6ff;
+        font-size: 13px; cursor: pointer; }
+</style>
+</head>
+<body>
+<div class="card">
+  <h1>🎙️ Qwen3-TTS Voice Cloner</h1>
+  <div class="sub">Qwen3-TTS-12Hz-1.7B-Base · Modal L4 · long scripts are spoken sentence-by-sentence for natural prosody</div>
+  <span id="pill" class="pill loading">⏳ Model warming up…</span>
 
-    api = FastAPI()
-    api.add_middleware(
-        CORSMiddleware,
-        allow_origins=ALLOWED_ORIGINS,
-        allow_methods=["POST", "OPTIONS"],
-        allow_headers=["*"],
-    )
+  <form id="f">
+    <label>1. Reference audio (3+ seconds of the voice to clone — wav/mp3/m4a)</label>
+    <input type="file" id="refAudio" accept="audio/*" required>
 
-    @api.get("/", response_class=HTMLResponse)
-    def index():
-        return FRONTEND_HTML
+    <label>2. Transcript of the reference audio (what is said in it, word for word)</label>
+    <input type="text" id="refText" placeholder="e.g. Okay, yeah, I resent you. I love you…">
 
-    @api.post("/tts")
-    async def tts_proxy(request: Request):
-        try:
-            payload = await request.json()
-        except Exception:
-            raise HTTPException(400, "Invalid JSON body")
+    <label>3. Language</label>
+    <select id="lang">
+      <option value="auto">Auto-detect</option>
+      <option value="English">English</option><option value="Chinese">Chinese</option>
+      <option value="Japanese">Japanese</option><option value="Korean">Korean</option>
+      <option value="German">German</option><option value="French">French</option>
+      <option value="Russian">Russian</option><option value="Portuguese">Portuguese</option>
+      <option value="Spanish">Spanish</option><option value="Italian">Italian</option>
+    </select>
 
-        try:
-            # First call triggers the GPU class cold start.
-            # Subsequent calls reuse the warm container.
-            wav_bytes = await TTS().synthesize.remote.aio(payload)
-        except ValueError as e:
-            raise HTTPException(400, str(e))
-        except Exception as e:
-            raise HTTPException(500, f"Synthesis failed: {e}")
+    <label>4. Your script</label>
+    <textarea id="text" placeholder="Paste your full script here. It will be split into natural sentences and spoken chunk by chunk — it won't be dumped into the model all at once."></textarea>
 
-        return Response(wav_bytes, media_type="audio/wav")
+    <button id="go" disabled>Clone voice & speak</button>
+  </form>
 
-    return api
+  <div id="status"></div>
+  <div id="progressWrap"><div id="progress"></div></div>
+  <a id="dl">⬇ Download full recording</a>
+</div>
+
+<script>
+const pill = document.getElementById('pill'), go = document.getElementById('go'),
+      statusEl = document.getElementById('status'), pw = document.getElementById('progressWrap'),
+      prog = document.getElementById('progress'), dl = document.getElementById('dl');
+
+// Poll model status — page itself is already usable, we just gate the button
+async function poll() {
+  try {
+    const r = await fetch('/status'); const j = await r.json();
+    if (j.ready) { pill.className = 'pill ready'; pill.textContent = '✅ Model ready';
+      go.disabled = false; return; }
+    if (j.error) { pill.className = 'pill error'; pill.textContent = '❌ ' + j.error; return; }
+  } catch (e) {}
+  setTimeout(poll, 2000);
+}
+poll();
+
+let audioCtx = null, nextPlayTime = 0, collected = [], sampleRate = 24000;
+
+document.getElementById('f').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const file = document.getElementById('refAudio').files[0];
+  if (!file) return;
+  go.disabled = true; dl.style.display = 'none'; collected = [];
+  statusEl.textContent = 'Uploading & cloning voice…'; pw.style.display = 'block';
+  prog.style.width = '2%';
+
+  audioCtx = audioCtx || new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 24000 });
+  nextPlayTime = Math.max(nextPlayTime, audioCtx.currentTime + 0.1);
+
+  const fd = new FormData();
+  fd.append('ref_audio', file);
+  fd.append('ref_text', document.getElementById('refText').value);
+  fd.append('text', document.getElementById('text').value);
+  fd.append('language', document.getElementById('lang').value);
+
+  const res = await fetch('/synthesize', { method: 'POST', body: fd });
+  const reader = res.body.getReader(), dec = new TextDecoder();
+  let buf = '';
+
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buf += dec.decode(value, { stream: true });
+    let idx;
+    while ((idx = buf.indexOf('\n\n')) >= 0) {
+      const raw = buf.slice(0, idx); buf = buf.slice(idx + 2);
+      if (!raw.startsWith('data: ')) continue;
+      const msg = JSON.parse(raw.slice(6));
+      if (msg.error) { statusEl.textContent = '⚠️ ' + msg.error; break; }
+      if (msg.total) { statusEl.textContent = `Speaking… chunk 1 of ${msg.total}`; continue; }
+      if (msg.audio) {
+        const wav = Uint8Array.from(atob(msg.audio), c => c.charCodeAt(0));
+        const ab = await audioCtx.decodeAudioData(wav.buffer);
+        sampleRate = ab.sampleRate; collected.push(ab);
+        const src = audioCtx.createBufferSource(); src.buffer = ab;
+        src.connect(audioCtx.destination);
+        src.start(nextPlayTime);                       // seamless queueing
+        nextPlayTime += ab.duration + 0.12;            // tiny breath between sentences
+        statusEl.textContent = `Speaking… chunk ${msg.i + 1}`;
+        prog.style.width = Math.min(99, (msg.i + 1) * 8) + '%';
+      }
+      if (msg.done) {
+        statusEl.textContent = '✅ Done — played ' + collected.length + ' chunks in your cloned voice.';
+        prog.style.width = '100%'; dl.style.display = 'block';
+      }
+    }
+  }
+  go.disabled = false;
+});
+
+// Concatenate all chunks (with gaps) and export one WAV file
+dl.addEventListener('click', () => {
+  const gap = Math.round(sampleRate * 0.12);
+  const total = collected.reduce((s, b) => s + b.length + gap, 0);
+  const out = audioCtx.createBuffer(collected[0].numberOfChannels, total, sampleRate);
+  let off = 0;
+  for (const b of collected) { for (let c = 0; c < b.numberOfChannels; c++)
+    out.getChannelData(c).set(b.getChannelData(c), off); off += b.length + gap; }
+  const n = out.length, data = out.getChannelData(0), bytes = new DataView(new ArrayBuffer(44 + n * 2));
+  const ws = (o, s) => { for (let i = 0; i < s.length; i++) bytes.setUint8(o + i, s.charCodeAt(i)); };
+  ws(0, 'RIFF'); bytes.setUint32(4, 36 + n * 2, true); ws(8, 'WAVEfmt ');
+  bytes.setUint32(16, 16, true); bytes.setUint16(20, 1, true); bytes.setUint16(22, 1, true);
+  bytes.setUint32(24, sampleRate, true); bytes.setUint32(28, sampleRate * 2, true);
+  bytes.setUint16(32, 2, true); bytes.setUint16(34, 16, true); ws(36, 'data');
+  bytes.setUint32(40, n * 2, true);
+  for (let i = 0; i < n; i++) { const s = Math.max(-1, Math.min(1, data[i]));
+    bytes.setInt16(44 + i * 2, s < 0 ? s * 0x8000 : s * 0x7FFF, true); }
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([bytes.buffer], { type: 'audio/wav' }));
+  a.download = 'clone.wav'; a.click();
+});
+</script>
+</body>
+</html>"""
