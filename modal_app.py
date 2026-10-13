@@ -138,20 +138,38 @@ class TTS:
         and the frontend is served instantly while weights load."""
         self.ready_event = threading.Event()
         self.load_error = None
+        self.status_msg = "Loading model weights…"
         self.gen_lock = threading.Lock()          # serialize GPU generation
         threading.Thread(target=self._load_model, daemon=True).start()
 
     def _load_model(self):
+        import os
+
         try:
             import torch
+            from huggingface_hub import snapshot_download
             from qwen_tts import Qwen3TTSModel
 
+            if not os.path.isdir(MODEL_DIR) or not os.listdir(MODEL_DIR):
+                # Volume is empty (download step was skipped or failed) —
+                # fetch the weights now. They persist in the volume, so this
+                # self-heals at most once. This is what previously caused:
+                # HFValidationError: Repo id must be in the form ...
+                self.status_msg = "Downloading model weights into the volume (one-time, ~4GB)…"
+                snapshot_download(MODEL_ID, local_dir=MODEL_DIR)
+                try:
+                    weights_volume.commit()
+                except Exception:
+                    pass
+
+            self.status_msg = "Loading model onto the L4 GPU…"
             self.model = Qwen3TTSModel.from_pretrained(
                 MODEL_DIR,                        # served from the cached volume
                 device_map="cuda:0",
                 dtype=torch.bfloat16,
                 attn_implementation="sdpa",       # use "flash_attention_2" if you add flash-attn to the image
             )
+            self.status_msg = None
         except Exception as e:                    # surfaced to the frontend
             self.load_error = f"{type(e).__name__}: {e}"
         finally:
@@ -176,9 +194,11 @@ class TTS:
         @web_app.get("/status")
         async def status():
             """Frontend polls this to show a 'warming up' / 'ready' indicator."""
+            ready = self.ready_event.is_set() and self.load_error is None
             return {
-                "ready": self.ready_event.is_set() and self.load_error is None,
+                "ready": ready,
                 "error": self.load_error,
+                "message": self.status_msg or ("Model ready" if ready else ""),
             }
 
         # NOTE: plain `def` (not async) — FastAPI runs sync endpoints in a
@@ -347,6 +367,8 @@ async function poll() {
     if (j.ready) { pill.className = 'pill ready'; pill.textContent = '✅ Model ready';
       go.disabled = false; return; }
     if (j.error) { pill.className = 'pill error'; pill.textContent = '❌ ' + j.error; return; }
+    pill.className = 'pill loading';
+    pill.textContent = '⏳ ' + (j.message || 'Model warming up…');
   } catch (e) {}
   setTimeout(poll, 2000);
 }
