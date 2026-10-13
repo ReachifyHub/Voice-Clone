@@ -114,7 +114,18 @@ def chunk_text(text: str) -> list[str]:
 # --------------------------------------------------------------------------- #
 @app.cls(
     gpu="L4",
-    image=image,
+    image=(
+        modal.Image.debian_slim(python_version="3.12")
+        .apt_install("sox")  # silences the torchaudio 'sox not found' warning
+        .pip_install(
+            "qwen-tts",
+            "accelerate",
+            "fastapi[standard]",
+            "python-multipart",
+            "soundfile",
+            "numpy",
+        )
+    ),
     volumes={"/models": weights_volume},
     scaledown_window=15 * 60,   # keep the container (and warm model) alive 15 min
     timeout=60 * 30,
@@ -122,10 +133,9 @@ def chunk_text(text: str) -> list[str]:
 class TTS:
     @modal.enter()
     def startup(self):
-        """Runs when the container starts. IMPORTANT: this must return fast,
-        because Modal starts routing HTTP traffic only after @modal.enter
-        returns. So we kick the (slow) model load off in a daemon thread and
-        serve the frontend immediately while weights load in the background."""
+        """Must return fast — the ASGI app only starts serving after this.
+        So the (slow) model load happens in a daemon thread in the background,
+        and the frontend is served instantly while weights load."""
         self.ready_event = threading.Event()
         self.load_error = None
         self.gen_lock = threading.Lock()          # serialize GPU generation
@@ -147,57 +157,64 @@ class TTS:
         finally:
             self.ready_event.set()
 
-    # ------------------------------ endpoints ------------------------------ #
-    @modal.fastapi_endpoint(method="GET")
-    def status(self):
-        """Frontend polls this to show a 'warming up' / 'ready' indicator."""
-        return {
-            "ready": self.ready_event.is_set() and self.load_error is None,
-            "error": self.load_error,
-        }
+    # -------------------- single app, single URL -------------------- #
+    @modal.asgi_app()
+    def web(self):
+        from fastapi import FastAPI, File, Form, UploadFile
+        from fastapi.responses import HTMLResponse, Response, StreamingResponse
 
-    @modal.fastapi_endpoint(method="GET")
-    def home(self):
-        """Serves the UI instantly — no model dependency."""
-        from fastapi.responses import HTMLResponse
+        web_app = FastAPI()
 
-        return HTMLResponse(FRONTEND_HTML)
+        @web_app.get("/")
+        async def home():
+            return HTMLResponse(FRONTEND_HTML)
 
-    @modal.fastapi_endpoint(method="POST")
-    async def synthesize(
-        self,
-        ref_audio: "object",   # UploadFile — annotated below via fastapi
-        ref_text: str = "",
-        text: str = "",
-        language: str = "auto",
-    ):
-        """Voice-clone endpoint: accepts your reference audio + transcript and
-        the script to speak, then streams synthesized audio chunk-by-chunk
-        (server-sent events) so playback starts after the first sentence."""
-        from fastapi import UploadFile
-        from fastapi.responses import StreamingResponse
+        @web_app.get("/favicon.ico")
+        async def favicon():
+            return Response(status_code=204)   # stop the 404 noise in logs
 
-        ref_audio: UploadFile = ref_audio  # type: ignore[no-redef]
+        @web_app.get("/status")
+        async def status():
+            """Frontend polls this to show a 'warming up' / 'ready' indicator."""
+            return {
+                "ready": self.ready_event.is_set() and self.load_error is None,
+                "error": self.load_error,
+            }
 
-        if not self.ready_event.is_set():
+        # NOTE: plain `def` (not async) — FastAPI runs sync endpoints in a
+        # threadpool, so the blocking GPU stream below doesn't freeze the
+        # event loop for other requests.
+        @web_app.post("/synthesize")
+        def synthesize(
+            ref_audio: UploadFile = File(...),
+            ref_text: str = Form(""),
+            text: str = Form(""),
+            language: str = Form("auto"),
+        ):
+            """Voice-clone endpoint: accepts your reference audio + transcript and
+            the script to speak, then streams synthesized audio chunk-by-chunk
+            (server-sent events) so playback starts after the first sentence."""
+            if not self.ready_event.is_set():
+                return StreamingResponse(
+                    _sse({"error": "Model is still warming up — try again in a moment."}),
+                    media_type="text/event-stream",
+                )
+            if self.load_error:
+                return StreamingResponse(
+                    _sse({"error": f"Model failed to load: {self.load_error}"}),
+                    media_type="text/event-stream",
+                )
+            if not text.strip():
+                return StreamingResponse(_sse({"error": "No script provided."}),
+                                         media_type="text/event-stream")
+
+            ref_bytes = ref_audio.file.read()
             return StreamingResponse(
-                _sse({"error": "Model is still warming up — try again in a moment."}),
+                self._generate_stream(ref_bytes, ref_text, text, language),
                 media_type="text/event-stream",
             )
-        if self.load_error:
-            return StreamingResponse(
-                _sse({"error": f"Model failed to load: {self.load_error}"}),
-                media_type="text/event-stream",
-            )
-        if not text.strip():
-            return StreamingResponse(_sse({"error": "No script provided."}),
-                                     media_type="text/event-stream")
 
-        ref_bytes = await ref_audio.read()
-        return StreamingResponse(
-            self._generate_stream(ref_bytes, ref_text, text, language),
-            media_type="text/event-stream",
-        )
+        return web_app
 
     # --------------------------- generation core --------------------------- #
     def _generate_stream(self, ref_bytes: bytes, ref_text: str,
